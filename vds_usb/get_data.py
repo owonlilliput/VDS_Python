@@ -14,17 +14,30 @@ WaveFormInfo = namedtuple('WaveFormInfo',
 WaveForm = namedtuple('WaveForm',
                       ['waveform_info', 'data'])
 
+WaveFormMemInfo = namedtuple('WaveFormMemInfo',
+                             ['name', 'data_len', 'freq', 'ref', 'start', 'screenlen', 'slow'])
+
+WaveFormMem = namedtuple('WaveFormMem',
+                         ['waveform_mem_info', 'data'])
+
+MEM_BUFFER_SIZE = 16384
+CHANNEL_NUMBER = 4
+
+
+def print_array(buf):
+    for b in buf:
+        if ord('0') <= b <= ord('z'):
+            b = chr(b)
+        print(b, end=',')
+    print()
+
 
 def collect_cmds():
     buffers = []
 
     def append(buf):
         buffers.append(buf)
-        for b in buf:
-            if ord('0') <= b <= ord('z'):
-                b = chr(b)
-            print(b, end=',')
-        print()
+        print_array(buf)
 
     pack_cmds(append)
 
@@ -51,7 +64,7 @@ def pack_cmds(append):
     '''
 
     # dev_src.write(pack('>2si3sB', b':M', 4, b'MDP', 1))
-    mem = 1
+    mem = 3
     buf = pack('>3sB', b'MDP', mem)
     append(buf)
 
@@ -81,7 +94,7 @@ def pack_cmds(append):
     M,C,H,0,b,0,
     '''
     zero = 00
-    for chl in range(4):
+    for chl in range(CHANNEL_NUMBER):
         buf = pack('>3sBBB', b'MCH', chl, ord('o'), 1)
         append(buf)
         buf = pack('>3sBBB', b'MCH', chl, ord('c'), 1)
@@ -107,15 +120,78 @@ def pack_cmds(append):
     append(buf)
     buf = pack('>3sB', b'MFT', 0)
     append(buf)
-    buf = pack('>3sBB', b'MHR', ord('b'), 16)
+    buf = pack('>3sBB', b'MHR', ord('b'), 10)
     append(buf)
     buf = pack('>3sBi', b'MHR', ord('v'), 0)
     append(buf)
 
 
+def get_memory_data(dev):
+    # each bit indicate one channel on/off
+    chl_status = get_channel_status_bits()
+    req = pack('>5sB8s1s', b':SGDM', chl_status, bytes([0]) * 8, b'#')
+    print(req)
+
+    dev.write(req)
+    recv = dev.read(11)
+    print(recv)
+
+    # 4 args
+    complete_flag, trig_status_flag, chl_status, chl_datalen = unpack('>BBBi', recv[4:])
+
+    # compute all left data
+    chl_count = bin(chl_status).count('1')
+    left_len = chl_datalen * chl_count
+    print(chl_datalen, chl_count)
+
+    if not left_len or not complete_flag:
+        return
+
+    waveform_head_len = 1 + 4 * 6
+    head_patten = '>B' + 'i' * 6
+
+    wfs = []
+
+    for chl in range(CHANNEL_NUMBER):
+        chl_len = chl_datalen
+        print(chl, chl_len)
+        if chl > 0:
+            dev.read(11)
+
+        wf_data = b''
+
+        i = 0
+        while chl_len:
+            if chl_len > MEM_BUFFER_SIZE:
+                read_len = MEM_BUFFER_SIZE
+            else:
+                read_len = chl_len
+            recv = dev.read(read_len)
+            print(len(recv), ':', len(wf_data), ':', i)
+            wf_data = wf_data + recv
+            chl_len = chl_len - len(recv)
+            i = i + 1
+
+        print()
+        wfi = WaveFormMemInfo(*unpack(head_patten, wf_data[:waveform_head_len]))
+        wf_data = wf_data[waveform_head_len:wfi.data_len]
+        # use data between start and screenlen
+        wf = WaveFormMem(wfi, wf_data)
+        print(wfi)
+        wfs.append(wf)
+    return wfs
+
+
+def get_channel_status_bits():
+    if CHANNEL_NUMBER == 2:
+        return 0b0011
+    else:
+        return 0b1111
+
+
 def get_screen_data(dev):
     # each bit indicate one channel on/off
-    chl_status = 0b1111
+    chl_status = get_channel_status_bits()
     req = pack('>5sB8s1s', b':SGDT', chl_status, bytes([0]) * 8, b'#')
     print(req)
 
@@ -134,14 +210,14 @@ def get_screen_data(dev):
     left_len = frame_count * chl_count * chl_frame_len
     print(left_len)
 
-    if not left_len:
+    if not left_len or not complete_flag:
         return
 
     left_waveforms = dev.read(left_len)
     waveform_head_len = 4 * 8
     head_patten = '>' + 'i' * 8
 
-    wfs = [[] for _ in range(4)]
+    wfs = [[] for _ in range(CHANNEL_NUMBER)]
 
     left = left_waveforms
     # parse channel by channel and frame by frame
@@ -154,15 +230,7 @@ def get_screen_data(dev):
         wfs[wfi.name].append(wf)
         left = left[wfi.len:]
 
-    for wf in wfs:
-        data = wf[-1].data
-        y = np.array([int(v) for v in data])
-        wf_data_len = len(y)
-        x = np.linspace(0, wf_data_len, wf_data_len)
-        # print(len(wf), type(x), type(y))
-        plt.plot(x, y)
-
-    plt.show()
+    return wfs
 
 
 def get_all_info(dev):
@@ -196,7 +264,40 @@ def get_send_cmds_m(cmds):
     return b':M' + pack('>i', cmds_len) + reduce(lambda a, b: a + b, cmds)
 
 
-if __name__ == '__main__':
+def for_run(dev_src):
+    time.sleep(0.5)
+    dev_src.write(b':SDSLRUN#')
+
+    time.sleep(0.2)
+    print('get_screen_data')
+    return get_screen_data(dev_src)
+
+
+def for_mem(dev_src):
+    print('stop')
+    time.sleep(0.2)
+    dev_src.write(b':SDSLSTP#')
+    print(dev_src.read(1024))
+
+    time.sleep(0.2)
+    print('get_memory_data')
+    wfs = get_memory_data(dev_src)
+    dev_src.write(b':SDSLRUN#')
+    return wfs
+
+
+def plot_screen(datas):
+    for data in datas:
+        y = np.array([int(v) for v in data])
+        wf_data_len = len(y)
+        x = np.linspace(0, wf_data_len, wf_data_len)
+        # print(len(wf), type(x), type(y))
+        plt.plot(x, y)
+
+    plt.show()
+
+
+def main():
     u_dev = next(usb_find_device())
     # print(u_dev)
     dev_src = USBSource(u_dev)
@@ -204,12 +305,18 @@ if __name__ == '__main__':
     # dev_src.write(b':SDSLVER#')
     # print(dev_src.read(1024))
 
+    print('sync_cmds')
     sync_cmds = collect_cmds()
     dev_src.write(sync_cmds)
 
-    time.sleep(0.5)
-    dev_src.write(b':SDSLRUN#')
+    wfs = for_run(dev_src)
+    plot_screen([wf[-1].data for wf in wfs])
 
-    time.sleep(0.2)
-    get_screen_data(dev_src)
+    # wfs = for_mem(dev_src)
+    # plot_screen([wf.data for wf in wfs])
+
     dev_src.close()
+
+
+if __name__ == '__main__':
+    main()
