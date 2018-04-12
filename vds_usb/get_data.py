@@ -3,6 +3,7 @@ from collections import namedtuple
 from functools import reduce
 from struct import pack, unpack
 
+from vds_lan.lan_con import LanSource
 from vds_usb.usb_con import usb_find_device, USBSource
 
 import numpy as np
@@ -14,8 +15,9 @@ WaveFormInfo = namedtuple('WaveFormInfo',
 WaveForm = namedtuple('WaveForm',
                       ['waveform_info', 'data'])
 
-WaveFormMemInfo = namedtuple('WaveFormMemInfo',
-                             ['name', 'data_len', 'freq', 'ref', 'start', 'screenlen', 'slow'])
+WaveFormMemInfo = namedtuple('WaveFormMemInfo', ['name', 'data_len', 'freq', 'ref', 'start', 'screenlen',
+                                                 'plot_start', 'fpga_plot_rate', 'cpu_plot_rate',
+                                                 'ploted_pulls_from_start', 'slow'])
 
 WaveFormMem = namedtuple('WaveFormMem',
                          ['waveform_mem_info', 'data'])
@@ -23,23 +25,26 @@ WaveFormMem = namedtuple('WaveFormMem',
 MEM_BUFFER_SIZE = 16384
 CHANNEL_NUMBER = 4
 
+waveform_head_len = 1 + 4 * 10
+head_patten = '>B' + 'i' * 7 + 'f' + 'ii'
+
 
 def print_array(buf):
     for b in buf:
-        if ord('0') <= b <= ord('z'):
-            b = chr(b)
+        # if ord('0') <= b <= ord('z'):
+        #     b = chr(b)
         print(b, end=',')
     print()
 
 
-def collect_cmds():
+def collect_cmds(memth):
     buffers = []
 
     def append(buf):
         buffers.append(buf)
         print_array(buf)
 
-    pack_cmds(append)
+    pack_cmds(memth, append)
 
     cmd_buf = b''
     for buf in buffers:
@@ -53,7 +58,7 @@ def collect_cmds():
     return cmd_buf
 
 
-def pack_cmds(append):
+def pack_cmds(memth, append):
     """
 
     :param append:
@@ -64,7 +69,7 @@ def pack_cmds(append):
     '''
 
     # dev_src.write(pack('>2si3sB', b':M', 4, b'MDP', 1))
-    mem = 3
+    mem = memth
     buf = pack('>3sB', b'MDP', mem)
     append(buf)
 
@@ -126,7 +131,83 @@ def pack_cmds(append):
     append(buf)
 
 
-def get_memory_data(dev):
+def _deprecated_get_memory_data_lan(dev):
+    """
+    it is not for use now
+    :param dev:
+    :return:
+    """
+    wfs = []
+    all_once = False
+    for chl in range(CHANNEL_NUMBER):
+        left_length = 5000000
+
+        chl_once = False
+        wf_data = b''
+        while left_length:
+            req = pack('>5s2sBi1s', b':SGDM', bytes([0, ord('C')]), chl, left_length, b'#')
+            print(req)
+            print_array(req)
+
+            dev.write(req)
+            if not all_once:
+                recv = dev.read(11)
+                all_once = True
+                print(recv)
+                # 4 args
+                complete_flag, trig_status_flag, chl_status, _ = unpack('>BBBi', recv[4:])
+                continue
+
+            if not chl_once:
+                header = dev.read(waveform_head_len)
+                chl_once = True
+                wfi = WaveFormMemInfo(*unpack(head_patten, header))
+                left_length = wfi.data_len
+
+            recv = dev.read(left_length)
+            print(len(recv), end=',')
+            wf_data = wf_data + recv
+            left_length = left_length - len(recv)
+
+        # use data between start and screenlen
+        wf = WaveFormMem(wfi, wf_data)
+        print(wfi)
+        wfs.append(wf)
+
+    return wfs
+
+
+def get_memory_data_lan(dev):
+    req = pack('>5s2si1s', b':SGDM', bytes([0, ord('A')]), 0, b'#')
+    print(req)
+    print_array(req)
+
+    dev.write(req)
+    recv = dev.read(11)
+    print(recv)
+
+    # 4 args
+    complete_flag, trig_status_flag, chl_status, _ = unpack('>BBBi', recv[4:])
+
+    if not complete_flag:
+        return
+
+    wfs = []
+
+    for chl in range(CHANNEL_NUMBER):
+        header = dev.read(waveform_head_len)
+        wfi = WaveFormMemInfo(*unpack(head_patten, header))
+
+        wf_data = dev.read(wfi.data_len)
+
+        # use data between start and screenlen
+        wf = WaveFormMem(wfi, wf_data)
+        print(wfi)
+        wfs.append(wf)
+    return wfs
+
+
+def get_memory_data_usb(dev):
     # each bit indicate one channel on/off
     chl_status = get_channel_status_bits()
     req = pack('>5sB8s1s', b':SGDM', chl_status, bytes([0]) * 8, b'#')
@@ -146,9 +227,6 @@ def get_memory_data(dev):
 
     if not left_len or not complete_flag:
         return
-
-    waveform_head_len = 1 + 4 * 6
-    head_patten = '>B' + 'i' * 6
 
     wfs = []
 
@@ -174,7 +252,7 @@ def get_memory_data(dev):
 
         print()
         wfi = WaveFormMemInfo(*unpack(head_patten, wf_data[:waveform_head_len]))
-        wf_data = wf_data[waveform_head_len:wfi.data_len]
+        wf_data = wf_data[waveform_head_len:waveform_head_len + wfi.data_len]
         # use data between start and screenlen
         wf = WaveFormMem(wfi, wf_data)
         print(wfi)
@@ -190,6 +268,11 @@ def get_channel_status_bits():
 
 
 def get_screen_data(dev):
+    """
+    both work for usb and lan
+    :param dev:
+    :return:
+    """
     # each bit indicate one channel on/off
     chl_status = get_channel_status_bits()
     req = pack('>5sB8s1s', b':SGDT', chl_status, bytes([0]) * 8, b'#')
@@ -211,9 +294,10 @@ def get_screen_data(dev):
     print(left_len)
 
     if not left_len or not complete_flag:
-        return
+        return []
 
     left_waveforms = dev.read(left_len)
+    print(left_len, len(left_waveforms))
     waveform_head_len = 4 * 8
     head_patten = '>' + 'i' * 8
 
@@ -226,7 +310,7 @@ def get_screen_data(dev):
         wf_data = left[waveform_head_len:wfi.len]
         # use data between start and screenlen
         wf = WaveForm(wfi, wf_data[wfi.start:wfi.start + wfi.screenlen])
-        # print(wfi)
+        print(wfi)
         wfs[wfi.name].append(wf)
         left = left[wfi.len:]
 
@@ -266,27 +350,24 @@ def get_send_cmds_m(cmds):
 
 def for_run(dev_src):
     time.sleep(0.5)
-    dev_src.write(b':SDSLRUN#')
-
-    time.sleep(0.2)
-    print('get_screen_data')
+    print('for_run')
     return get_screen_data(dev_src)
 
 
-def for_mem(dev_src):
+def for_mem(dev_src, get_method):
     print('stop')
-    time.sleep(0.2)
+    time.sleep(0.5)
     dev_src.write(b':SDSLSTP#')
-    print(dev_src.read(1024))
+    print(dev_src.read(-1))
 
-    time.sleep(0.2)
-    print('get_memory_data')
-    wfs = get_memory_data(dev_src)
+    time.sleep(1)
+    print('for_mem')
+    wfs = get_method(dev_src)
     dev_src.write(b':SDSLRUN#')
     return wfs
 
 
-def plot_screen(datas):
+def draw_datas(datas):
     for data in datas:
         y = np.array([int(v) for v in data])
         wf_data_len = len(y)
@@ -298,22 +379,38 @@ def plot_screen(datas):
 
 
 def main():
-    u_dev = next(usb_find_device())
+    # usb source
+    # u_dev = next(usb_find_device())
     # print(u_dev)
-    dev_src = USBSource(u_dev)
+    # dev_src = USBSource(u_dev)
 
+    # lan source
+    dev_src = LanSource(('192.168.1.60', 2000))
+
+    # check version
     # dev_src.write(b':SDSLVER#')
     # print(dev_src.read(1024))
 
+    # sync cmds
+    memth = 4  # [1k,10k,100k,1M,5M]
     print('sync_cmds')
-    sync_cmds = collect_cmds()
+    sync_cmds = collect_cmds(memth)
     dev_src.write(sync_cmds)
+    time.sleep(0.5)
+    dev_src.write(b':SDSLRUN#')
 
+    # plot screen data
     wfs = for_run(dev_src)
-    plot_screen([wf[-1].data for wf in wfs])
+    # draw_datas([wf[-1].data for wf in wfs])
 
-    # wfs = for_mem(dev_src)
-    # plot_screen([wf.data for wf in wfs])
+    # plot memory data, to get mem data, you must get run time screen data before
+    if memth < 4:
+        wfs = for_mem(dev_src, get_memory_data_lan)
+    else:
+        wfs = for_mem(dev_src, get_memory_data_lan)
+
+    # wfs = for_mem(dev_src, get_memory_data_usb)
+    # draw_datas([wf.data for wf in wfs])
 
     dev_src.close()
 

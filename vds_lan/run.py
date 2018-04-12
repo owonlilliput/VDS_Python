@@ -12,10 +12,10 @@ def connect(address, cmd):
 
 
 if __name__ == '__main__':
-    # adr = '192.168.1.60', 2000
-    # cmd = b':SDSLVER#'
+    adr = '192.168.1.60', 2000
+    cmd = b':SDSLVER#'
 
-    adr = '192.168.1.72', 3000
+    # adr = '192.168.1.72', 3000
     # cmd = b'*IDN?\n'
-    cmd = b'STARTBIN'
+    # cmd = b'STARTBIN'
     connect(adr, cmd)
